@@ -1,21 +1,268 @@
 name: 'Tests: node.js < 10'
 
-on: [pull_request, push]
+on: [workflow_dispatch]
 
 permissions:
   contents: read
 
 jobs:
   tests:
-    uses: ljharb/actions/.github/workflows/node.yml@main
-    with:
-      range: '< 10'
-      type: minors
-      command: npm run tests-only
+    name: 'node 0.6.21'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      # The HOST node only installs dependencies and stages files: pre-1.0 npm
+      # speaks TLS 1.0 only and cannot reach any registry, so nothing at all is
+      # installed from inside the node 0.6 container.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 23
+
+      - name: 'pin the npm registry to the release date'
+        run: npm config set registry 'https://:2025-01-14T18%3A02%3A18.697000Z@time-machines-npm.sealsecurity.io/'
+
+      - name: 'install dependencies on the host'
+        run: npm install
+
+      # tape@5 uses syntax node 0.6 cannot parse. Stage tape@4 (which supports
+      # node 0.x) inside the repo so it is visible through the bind mount.
+      - name: 'stage tape@4 for the node 0.6 run'
+        run: |
+          npm install --prefix /tmp/tape4 tape@4
+          cp -a /tmp/tape4/node_modules ./tape4
+
+      # curl on CentOS 7 cannot reliably TLS-handshake nodejs.org, so the
+      # tarball is fetched on the host and read through the bind mount.
+      - name: 'fetch the node 0.6.21 source on the host'
+        run: curl -fsSLo node-v0.6.21.tar.gz https://nodejs.org/dist/v0.6.21/node-v0.6.21.tar.gz
+
+      # The driver replaces `nyc tape 'test/**/*.js'` for this leg only: nyc does
+      # not run on 0.6, and `node_modules/tape/bin/tape` cannot be used because
+      # pre-1.0 node has no `process.exitCode` and flushes stdout asynchronously
+      # at exit, so both the exit code and the `1..N` / `# fail` summary are lost
+      # and a failing suite reads green. This driver buffers every TAP row and
+      # writes the whole report plus an explicit PASS/FAIL verdict file at finish.
+      - name: 'write the node 0.6 tape driver'
+        run: |
+          cat > run06.js <<'RUN06'
+          'use strict';
+
+          var fs = require('fs');
+          var ROOT = '/src';
+
+          // Absence of a verdict, or a crash mid-run, must read as a failure.
+          fs.writeFileSync('/tmp/verdict06', 'FAIL');
+
+          var rows = [];
+          var emitted = false;
+
+          function writeOut(str) {
+              var buf = new Buffer(str, 'utf8');
+              var offset = 0;
+              while (offset < buf.length) {
+                  offset += fs.writeSync(1, buf, offset, buf.length - offset);
+              }
+          }
+
+          // Buffer every row and write ONCE from here. Appending per row while the
+          // suite runs throws: some qs tests mock a property on Object.prototype and
+          // fs.appendFileSync copies its options object through the mock.
+          function emit() {
+              if (emitted) { return; }
+              emitted = true;
+
+              var lines = ['TAP version 13'];
+              var count = 0;
+              var pass = 0;
+              var fail = 0;
+              var skip = 0;
+
+              for (var i = 0; i < rows.length; i++) {
+                  var row = rows[i];
+                  if (typeof row === 'string') {
+                      lines.push('# ' + String(row).replace(/[\r\n]+$/, ''));
+                  } else if (row && row.type === 'test') {
+                      lines.push('# ' + row.name + (row.skip ? ' # SKIP' : ''));
+                  } else if (row && row.type === 'assert') {
+                      count += 1;
+                      var name = typeof row.name === 'string' ? row.name : '(unnamed assert)';
+                      if (row.skip) {
+                          skip += 1;
+                          lines.push('ok ' + count + ' ' + name + ' # SKIP');
+                      } else if (row.ok) {
+                          pass += 1;
+                          lines.push('ok ' + count + ' ' + name);
+                      } else {
+                          fail += 1;
+                          lines.push('not ok ' + count + ' ' + name);
+                          lines.push('  ---');
+                          lines.push('    operator: ' + row.operator);
+                          lines.push('    expected: ' + row.expected);
+                          lines.push('    actual:   ' + row.actual);
+                          lines.push('    at:       ' + (row.file || row.at || ''));
+                          lines.push('  ...');
+                      }
+                  }
+              }
+
+              lines.push('');
+              lines.push('1..' + count);
+              lines.push('# tests ' + count);
+              lines.push('# pass  ' + (pass + skip));
+              lines.push('# skip  ' + skip);
+              lines.push('# fail  ' + fail);
+              lines.push('');
+
+              fs.writeFileSync('/tmp/verdict06', fail === 0 && count > 0 ? 'PASS' : 'FAIL');
+              writeOut(lines.join('\n') + '\n');
+          }
+
+          // Registered BEFORE the harness exists so it runs ahead of tape's own
+          // exit handler, which calls process.exit() and would cut this short.
+          process.on('exit', emit);
+
+          var test = require(ROOT + '/node_modules/tape');
+          var Test = require(ROOT + '/node_modules/tape/lib/test.js');
+
+          // --- engine gates, feature-detected so they are no-ops on modern node ---
+
+          // V8 3.6 does not update an array's `length` when an index is defined
+          // with an accessor.
+          var arrayLengthTracksAccessors = (function () {
+              try {
+                  var arr = [];
+                  Object.defineProperty(arr, 0, {
+                      get: function () { return 1; },
+                      set: function () {}
+                  });
+                  return arr.length === 1;
+              } catch (e) {
+                  return false;
+              }
+          }());
+
+          // node 0.6's UTF-8 decoder turns the 4-byte astral literals in
+          // test/stringify.js and test/utils.js into U+FFFD before the engine
+          // ever sees them.
+          var utf8DecodesAstral = (function () {
+              try {
+                  var s = new Buffer([0xF0, 0x90, 0x90, 0xB7]).toString('utf8');
+                  return s.length === 2 && s.charCodeAt(0) === 0xD801 && s.charCodeAt(1) === 0xDC37;
+              } catch (e) {
+                  return false;
+              }
+          }());
+
+          var engineSkips = {};
+          if (!arrayLengthTracksAccessors) {
+              engineSkips['name:avoids invoking array setters unnecessarily'] = true;
+          }
+          if (!utf8DecodesAstral) {
+              engineSkips['name:stringifies a querystring object'] = true;
+          }
+
+          // Same astral-literal cause, but this one is an assertion MESSAGE
+          // inside test/utils.js's `encode` block, not a subtest name, so it has
+          // to be gated at the assert level to keep the block's other asserts.
+          var assertSkips = {};
+          if (!utf8DecodesAstral) {
+              assertSkips['encodes in iso-8859-1'] = true;
+          }
+
+          var originalAssert = Test.prototype._assert;
+          Test.prototype._assert = function (ok, opts) {
+              if (opts && assertSkips[opts.message] === true) {
+                  opts.skip = true;
+              }
+              return originalAssert.call(this, ok, opts);
+          };
+
+          // Applied here, never in test/*.js: the test directory ships inside the
+          // published tarball and must stay byte-identical to the release.
+          var originalSubtest = Test.prototype.test;
+          Test.prototype.test = function (name, opts, cb) {
+              if (typeof name === 'string' && engineSkips['name:' + name] === true) {
+                  if (typeof opts === 'function') {
+                      cb = opts;
+                      opts = {};
+                  }
+                  if (!opts) { opts = {}; }
+                  opts.skip = true;
+                  return originalSubtest.call(this, name, opts, cb);
+              }
+              return originalSubtest.call(this, name, opts, cb);
+          };
+
+          var stream = test.createStream({ objectMode: true });
+          stream.on('data', function (row) { rows.push(row); });
+          test.onFinish(emit);
+
+          // The same four files `nyc tape 'test/**/*.js'` expands to.
+          require(ROOT + '/test/empty-keys-cases.js');
+          require(ROOT + '/test/parse.js');
+          require(ROOT + '/test/stringify.js');
+          require(ROOT + '/test/utils.js');
+          RUN06
+
+      - name: 'write the node 0.6 container script'
+        run: |
+          cat > run06.sh <<'RUN06SH'
+          #!/bin/bash
+          set -ex
+
+          # CentOS 7 is EOL, so its mirrors are gone: repoint yum at the vault
+          # BEFORE installing anything.
+          sed -i 's|^mirrorlist|#mirrorlist|g' /etc/yum.repos.d/CentOS-*.repo
+          sed -i 's|^#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g' /etc/yum.repos.d/CentOS-*.repo
+          yum install -y gcc gcc-c++ make python2 tar curl zlib-devel
+
+          # node 0.6's waf `configure` shells out to `python`, which must be python2.
+          ln -sf /usr/bin/python2 /usr/bin/python
+
+          # No pre-built binary exists for node 0.4-0.7: compile 0.6.21 from source.
+          mkdir -p /tmp/node06src
+          tar xzf /src/node-v0.6.21.tar.gz -C /tmp/node06src
+          cd /tmp/node06src/node-v0.6.21
+          ./configure --prefix=/opt/node06 --without-ssl --without-snapshot
+          make -j"$(nproc)"
+          make install
+          /opt/node06/bin/node --version
+
+          cd /src
+
+          # Swap the host-staged tape@4 in place of tape@5, and nest tape@4's own
+          # dependency tree (minus tape itself) under it, so the test files and tape
+          # resolve to ONE tape instance.
+          rm -rf node_modules/tape
+          mkdir -p node_modules/tape
+          cp -a tape4/tape/. node_modules/tape/
+          mkdir -p node_modules/tape/node_modules
+          for dep in tape4/*; do
+              depname=$(basename "$dep")
+              if [ "$depname" != "tape" ] && [ ! -e "node_modules/tape/node_modules/$depname" ]; then
+                  cp -a "$dep" node_modules/tape/node_modules/
+              fi
+          done
+
+          cp /src/run06.js /tmp/run06.js
+
+          echo '=== Test suite: node 0.6.21 ==='
+          /opt/node06/bin/node /tmp/run06.js
+          cp /tmp/verdict06 /src/verdict06
+          test "$(cat /tmp/verdict06)" = PASS
+          RUN06SH
+
+      - name: 'build node 0.6.21 and run the test suite'
+        run: |
+          docker run --rm -v "$PWD":/src -w /src centos:7 /bin/bash /src/run06.sh
+          test "$(cat verdict06)" = PASS
 
   node:
     name: 'node < 10'
     needs: [tests]
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - run: true

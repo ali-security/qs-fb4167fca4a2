@@ -30,6 +30,24 @@ test('merge()', function (t) {
     var noOptionsNonObjectSource = utils.merge({ foo: 'baz' }, 'bar');
     t.deepEqual(noOptionsNonObjectSource, { foo: 'baz', bar: true });
 
+    t.test('respects arrayLimit when concatenating a non-object target with an array source', function (st) {
+        var arr = [];
+        for (var i = 0; i < 30; i++) {
+            arr[arr.length] = i;
+        }
+        var merged = utils.merge('seed', arr, { arrayLimit: 20 });
+        st.notOk(Array.isArray(merged), 'result is not an array when over limit');
+        st.equal(Object.keys(merged).length, 31, 'all values are preserved');
+        st.end();
+    });
+
+    t.test('stays an array when concatenating within arrayLimit', function (st) {
+        var merged = utils.merge('seed', [1, 2, 3], { arrayLimit: 20 });
+        st.ok(Array.isArray(merged), 'result is an array when within limit');
+        st.deepEqual(merged, ['seed', 1, 2, 3]);
+        st.end();
+    });
+
     var func = function f() {};
     t.deepEqual(
         utils.merge(func, { foo: 'bar' }),

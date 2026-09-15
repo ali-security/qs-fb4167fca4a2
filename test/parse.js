@@ -1289,6 +1289,41 @@ test('DOS', function (t) {
     t.end();
 });
 
+test('comma + arrayLimit', function (t) {
+    t.test('comma-separated values within arrayLimit stay as array', function (st) {
+        var result = qs.parse('a=1,2,3', { comma: true, arrayLimit: 5 });
+        st.ok(Array.isArray(result.a), 'result is an array');
+        st.deepEqual(result.a, ['1', '2', '3'], 'all values present');
+        st.end();
+    });
+
+    t.test('comma-separated values exceeding arrayLimit convert to object', function (st) {
+        var arr = [];
+        for (var i = 0; i < 30; i++) {
+            arr[arr.length] = String(i);
+        }
+        var result = qs.parse('a=' + arr.join(','), { comma: true, arrayLimit: 20 });
+        st.notOk(Array.isArray(result.a), 'result is not an array when over limit');
+        st.equal(Object.keys(result.a).length, 30, 'all values are preserved');
+        st.end();
+    });
+
+    t.end();
+});
+
+test('merge() enforces arrayLimit when combining a scalar with an array', function (t) {
+    var arr = [];
+    for (var i = 0; i < 50; i++) {
+        arr[arr.length] = 'x' + i;
+    }
+    var result = qs.parse('a=seed&a[]=' + arr.join('&a[]='), { arrayLimit: 20 });
+
+    t.notOk(Array.isArray(result.a), 'arrayLimit is respected: result is an object, not an array');
+    t.equal(Object.keys(result.a).length, 51, 'all values are preserved');
+
+    t.end();
+});
+
 test('arrayLimit boundary conditions', function (t) {
     t.test('exactly at the limit stays as array', function (st) {
         var result = qs.parse('a[]=1&a[]=2&a[]=3', { arrayLimit: 3 });
